@@ -1,0 +1,83 @@
+name: build
+
+on:
+  push:
+    branches: [ "main" ]
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pyinstaller
+
+      - name: Build
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed --name "AI脱敏工具" main.py
+
+      - name: Prepare release file (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          Move-Item "dist/AI脱敏工具.exe" "release/AI脱敏工具-Windows.exe"
+
+      - name: Prepare release file (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p release
+          mv "dist/AI脱敏工具" "release/AI脱敏工具-macOS"
+          chmod +x "release/AI脱敏工具-macOS"
+
+      - name: Prepare release file (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p release
+          mv "dist/AI脱敏工具" "release/AI脱敏工具-Linux"
+          chmod +x "release/AI脱敏工具-Linux"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AI脱敏工具-${{ runner.os }}
+          path: release/*
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: AI脱敏工具-*
+          merge-multiple: true
+          path: release
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
