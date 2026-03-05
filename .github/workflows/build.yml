@@ -48,8 +48,13 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           mkdir -p release
-          mv "dist/AI脱敏工具" "release/AI脱敏工具-macOS"
-          chmod +x "release/AI脱敏工具-macOS"
+          # macOS 上 --windowed 通常会生成 .app 目录
+          if [ -d "dist/AI脱敏工具.app" ]; then
+            ditto -c -k --sequesterRsrc --keepParent "dist/AI脱敏工具.app" "release/AI脱敏工具-macOS.app.zip"
+          else
+            mv "dist/AI脱敏工具" "release/AI脱敏工具-macOS"
+            chmod +x "release/AI脱敏工具-macOS"
+          fi
 
       - name: Prepare release file (Linux)
         if: runner.os == 'Linux'
