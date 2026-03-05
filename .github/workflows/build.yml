@@ -2,11 +2,8 @@ name: build
 
 on:
   push:
-    branches: [ "main" ]
     tags:
       - "v*"
-  pull_request:
-  workflow_dispatch:
 
 permissions:
   contents: write
@@ -21,68 +18,35 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install PyInstaller
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          python -m pip install pyinstaller
+          pip install -r requirements.txt
+          pip install pyinstaller
 
       - name: Build
         run: |
-          pyinstaller --noconfirm --clean --onefile --windowed --name "AI脱敏工具" main.py
+          pyinstaller --noconfirm --onefile main.py
 
-      - name: Prepare release file (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          New-Item -ItemType Directory -Force -Path release | Out-Null
-          Move-Item "dist/AI脱敏工具.exe" "release/AI脱敏工具-Windows.exe"
-
-      - name: Prepare release file (macOS)
-        if: runner.os == 'macOS'
+      - name: Package
+        shell: bash
         run: |
           mkdir -p release
-          # macOS 上 --windowed 通常会生成 .app 目录
-          if [ -d "dist/AI脱敏工具.app" ]; then
-            ditto -c -k --sequesterRsrc --keepParent "dist/AI脱敏工具.app" "release/AI脱敏工具-macOS.app.zip"
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            cp dist/main.exe release/ai-context-desensitizer-windows.exe
+          elif [[ "${{ runner.os }}" == "macOS" ]]; then
+            cp dist/main release/ai-context-desensitizer-macos
           else
-            mv "dist/AI脱敏工具" "release/AI脱敏工具-macOS"
-            chmod +x "release/AI脱敏工具-macOS"
+            cp dist/main release/ai-context-desensitizer-linux
           fi
 
-      - name: Prepare release file (Linux)
-        if: runner.os == 'Linux'
-        run: |
-          mkdir -p release
-          mv "dist/AI脱敏工具" "release/AI脱敏工具-Linux"
-          chmod +x "release/AI脱敏工具-Linux"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: AI脱敏工具-${{ runner.os }}
-          path: release/*
-
-  release:
-    if: startsWith(github.ref, 'refs/tags/')
-    needs: build
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: AI脱敏工具-*
-          merge-multiple: true
-          path: release
-
-      - name: Create GitHub Release
+      - name: Upload to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: release/*
