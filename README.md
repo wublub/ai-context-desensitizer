@@ -19,10 +19,49 @@ A lightweight tool for desensitizing sensitive information in text data and docu
 
 ## Installation / 安装
 
-### 1) Create venv (recommended) / 创建虚拟环境（推荐）
-```bash
-python -m venv .venv
-# Windows PowerShell:
-.venv\Scripts\Activate.ps1
-# macOS/Linux:
-source .venv/bin/activate
+## Windows 怎么用
+
+1. 下载 `ai-context-desensitizer-windows.exe`
+2. 双击运行
+
+------
+
+## macOS 怎么用（常见会提示“无法打开/来自不明开发者”）
+
+1. 下载 `ai-context-desensitizer-macos`
+2. 给执行权限（第一次需要）：
+
+```
+<BASH>
+chmod +x ai-context-desensitizer-macos
+```
+
+1. 运行：
+
+```
+<BASH>
+./ai-context-desensitizer-macos
+```
+
+如果提示被系统拦截：
+
+- 系统设置 → 隐私与安全 → 允许打开
+
+------
+
+## Linux 怎么用
+
+1. 下载 `ai-context-desensitizer-linux`
+2. 给执行权限：
+
+```
+<BASH>
+chmod +x ai-context-desensitizer-linux
+```
+
+1. 运行：
+
+```
+<BASH>
+./ai-context-desensitizer-linux
+```
