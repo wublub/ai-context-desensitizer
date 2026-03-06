@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import ctypes
+from ctypes import wintypes
+import html
 import os
+import re
 import sys
 from pathlib import Path
 import tkinter as tk
@@ -21,6 +25,9 @@ from desensitizer import (
 
 
 APP_NAME = "AI脱敏工具"
+CF_UNICODETEXT = 13
+GMEM_MOVEABLE = 0x0002
+CF_HTML_NAME = "HTML Format"
 
 
 def get_app_data_dir() -> Path:
@@ -42,6 +49,307 @@ def _strip_token_brackets(name_or_token: str) -> str:
     return s
 
 
+def markdown_to_word_html(text: str) -> str:
+    """把常见 Markdown 转成适合粘贴到 Word 的 HTML 片段（不含 <html>/<body> 外壳）。"""
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    parts: list[str] = []
+    list_tag: str | None = None
+
+    def close_list() -> None:
+        nonlocal list_tag
+        if list_tag:
+            parts.append(f"</{list_tag}>")
+            list_tag = None
+
+    def open_list(tag: str) -> None:
+        nonlocal list_tag
+        if list_tag == tag:
+            return
+        close_list()
+        parts.append(f"<{tag}>")
+        list_tag = tag
+
+    def render_inline(value: str) -> str:
+        escaped = html.escape(value)
+        escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+        escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
+        escaped = re.sub(r"__(.+?)__", r"<strong>\1</strong>", escaped)
+        escaped = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"<em>\1</em>", escaped)
+        escaped = re.sub(r"(?<!_)_(?!_)(.+?)(?<!_)_(?!_)", r"<em>\1</em>", escaped)
+        escaped = re.sub(
+            r"\[([^\]]+)\]\((https?://[^)\s]+)\)",
+            r'<a href="\2">\1</a>',
+            escaped,
+        )
+        return escaped
+
+    def split_table_row(value: str) -> list[str]:
+        s = (value or "").strip()
+        if s.startswith("|"):
+            s = s[1:]
+        if s.endswith("|"):
+            s = s[:-1]
+
+        cells: list[str] = []
+        cur: list[str] = []
+        escape = False
+        for ch in s:
+            if escape:
+                cur.append(ch)
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == "|":
+                cells.append("".join(cur).strip())
+                cur = []
+                continue
+            cur.append(ch)
+        cells.append("".join(cur).strip())
+        return cells
+
+    def parse_table_sep(value: str) -> list[str] | None:
+        s = (value or "").strip()
+        if not s:
+            return None
+        if s.startswith("|"):
+            s = s[1:]
+        if s.endswith("|"):
+            s = s[:-1]
+        cells = [c.strip() for c in s.split("|")]
+        if len(cells) < 2:
+            return None
+        aligns: list[str] = []
+        for c in cells:
+            if not re.match(r"^:?-{3,}:?$", c):
+                return None
+            if c.startswith(":") and c.endswith(":"):
+                aligns.append("center")
+            elif c.endswith(":"):
+                aligns.append("right")
+            else:
+                aligns.append("left")
+        return aligns
+
+    def build_table(header_cells: list[str], aligns: list[str], body_rows: list[list[str]]) -> None:
+        col_count = max(len(header_cells), len(aligns))
+        if col_count < 2:
+            return
+
+        def style_cell(*, is_header: bool, align: str) -> str:
+            base = "border:1px solid #999;padding:4px;vertical-align:top;"
+            bg = "background:#f3f3f3;" if is_header else ""
+            return base + bg + f"text-align:{align};"
+
+        parts.append('<table border="1" cellspacing="0" cellpadding="4" style="border-collapse:collapse;">')
+        parts.append("<thead><tr>")
+        for i in range(col_count):
+            cell = header_cells[i] if i < len(header_cells) else ""
+            align = aligns[i] if i < len(aligns) else "left"
+            parts.append(f'<th style="{style_cell(is_header=True, align=align)}">{render_inline(cell)}</th>')
+        parts.append("</tr></thead>")
+
+        parts.append("<tbody>")
+        for row in body_rows:
+            parts.append("<tr>")
+            for i in range(col_count):
+                cell = row[i] if i < len(row) else ""
+                align = aligns[i] if i < len(aligns) else "left"
+                parts.append(f'<td style="{style_cell(is_header=False, align=align)}">{render_inline(cell)}</td>')
+            parts.append("</tr>")
+        parts.append("</tbody></table>")
+
+    i = 0
+    while i < len(lines):
+        line = (lines[i] or "").rstrip()
+        stripped = line.strip()
+
+        # 表格（GFM）：
+        # | A | B |
+        # |---|---|
+        # | 1 | 2 |
+        if stripped and i + 1 < len(lines) and "|" in stripped:
+            aligns = parse_table_sep(lines[i + 1])
+            if aligns is not None:
+                header_cells = split_table_row(stripped)
+                if len(header_cells) >= 2:
+                    close_list()
+                    rows: list[list[str]] = []
+                    j = i + 2
+                    while j < len(lines):
+                        row_line = (lines[j] or "").rstrip()
+                        row_stripped = row_line.strip()
+                        if not row_stripped:
+                            break
+                        if "|" not in row_stripped:
+                            break
+                        if parse_table_sep(row_stripped) is not None:
+                            break
+                        rows.append(split_table_row(row_stripped))
+                        j += 1
+
+                    build_table(header_cells, aligns, rows)
+                    i = j
+                    continue
+
+        if not stripped:
+            close_list()
+            i += 1
+            continue
+
+        heading = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+        if heading:
+            close_list()
+            level = len(heading.group(1))
+            parts.append(f"<h{level}>{render_inline(heading.group(2).strip())}</h{level}>")
+            i += 1
+            continue
+
+        bullet = re.match(r"^[-*+]\s+(.*)$", stripped)
+        if bullet:
+            open_list("ul")
+            parts.append(f"<li>{render_inline(bullet.group(1).strip())}</li>")
+            i += 1
+            continue
+
+        numbered = re.match(r"^\d+[.)]\s+(.*)$", stripped)
+        if numbered:
+            open_list("ol")
+            parts.append(f"<li>{render_inline(numbered.group(1).strip())}</li>")
+            i += 1
+            continue
+
+        close_list()
+        parts.append(f"<p>{render_inline(stripped)}</p>")
+        i += 1
+
+    close_list()
+
+    if not parts:
+        return ""
+
+    return "\n".join(parts)
+
+
+def html_to_preview_text(text: str) -> str:
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    out: list[str] = []
+
+    def is_table_sep_line(value: str) -> bool:
+        aligns = re.sub(r"\s+", "", value or "")
+        if not aligns or "|" not in aligns:
+            return False
+        s = aligns.strip()
+        if s.startswith("|"):
+            s = s[1:]
+        if s.endswith("|"):
+            s = s[:-1]
+        cells = [c for c in s.split("|")]
+        if len(cells) < 2:
+            return False
+        return all(re.match(r"^:?-{3,}:?$", c) for c in cells)
+
+    def split_row(value: str) -> list[str]:
+        s = (value or "").strip()
+        if s.startswith("|"):
+            s = s[1:]
+        if s.endswith("|"):
+            s = s[:-1]
+        return [c.strip() for c in s.split("|")]
+
+    i = 0
+    while i < len(lines):
+        raw = lines[i] or ""
+        stripped = raw.strip()
+
+        # 表格：转成制表符分隔，便于 Word 直接粘贴为表格
+        if stripped and "|" in stripped and i + 1 < len(lines) and is_table_sep_line(lines[i + 1]):
+            header = split_row(stripped)
+            if len(header) >= 2:
+                out.append("\t".join(header))
+                j = i + 2
+                while j < len(lines):
+                    row_line = (lines[j] or "").strip()
+                    if not row_line:
+                        break
+                    if "|" not in row_line:
+                        break
+                    if is_table_sep_line(row_line):
+                        break
+                    row = split_row(row_line)
+                    out.append("\t".join(row))
+                    j += 1
+                out.append("")
+                i = j
+                continue
+
+        if not stripped:
+            out.append("")
+            i += 1
+            continue
+
+        heading = re.match(r"^(#{1,6})\s+(.*)$", stripped)
+        if heading:
+            out.append(heading.group(2).strip())
+            out.append("")
+            i += 1
+            continue
+
+        bullet = re.match(r"^[-*+]\s+(.*)$", stripped)
+        if bullet:
+            out.append(f"• {bullet.group(1).strip()}")
+            i += 1
+            continue
+
+        numbered = re.match(r"^(\d+)[.)]\s+(.*)$", stripped)
+        if numbered:
+            out.append(f"{numbered.group(1)}. {numbered.group(2).strip()}")
+            i += 1
+            continue
+
+        plain = stripped
+        plain = re.sub(r"\*\*(.+?)\*\*", r"\1", plain)
+        plain = re.sub(r"__(.+?)__", r"\1", plain)
+        plain = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"\1", plain)
+        plain = re.sub(r"(?<!_)_(?!_)(.+?)(?<!_)_(?!_)", r"\1", plain)
+        plain = re.sub(r"`([^`]+)`", r"\1", plain)
+        plain = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", r"\1（\2）", plain)
+        out.append(plain)
+        i += 1
+
+    while out and not out[-1]:
+        out.pop()
+    return "\n".join(out)
+
+
+def build_cf_html(html_fragment: str) -> bytes:
+    fragment = html_fragment.replace("\r\n", "\n").replace("\r", "\n")
+    style = "font-family:Calibri,'Microsoft YaHei',sans-serif;font-size:11pt;line-height:1.6;"
+    prefix = f"<html><body style=\"{style}\"><!--StartFragment-->"
+    suffix = "<!--EndFragment--></body></html>"
+    full_html = prefix + fragment + suffix
+    template = (
+        "Version:0.9\r\n"
+        "StartHTML:{start_html:010d}\r\n"
+        "EndHTML:{end_html:010d}\r\n"
+        "StartFragment:{start_fragment:010d}\r\n"
+        "EndFragment:{end_fragment:010d}\r\n"
+    )
+    dummy = template.format(start_html=0, end_html=0, start_fragment=0, end_fragment=0)
+    start_html = len(dummy.encode("utf-8"))
+    start_fragment = start_html + len(prefix.encode("utf-8"))
+    end_fragment = start_fragment + len(fragment.encode("utf-8"))
+    end_html = start_html + len(full_html.encode("utf-8"))
+    header = template.format(
+        start_html=start_html,
+        end_html=end_html,
+        start_fragment=start_fragment,
+        end_fragment=end_fragment,
+    )
+    return (header + full_html).encode("utf-8")
+
+
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -50,6 +358,7 @@ class App:
         self.root.minsize(1040, 680)
 
         self.root.bind_all("<Key>", self._on_any_key_for_easter)
+        self.root.bind_all("<Control-f>", self._on_find_slot_shortcut, add=True)
 
         self.app_dir = get_app_data_dir()
 
@@ -70,7 +379,7 @@ class App:
 
         self.shortcut_cfg: dict = {
             "pick": "<Control-c>",
-            "highlight_all": "<Control-h>",
+            "highlight_all": "<Control-Alt-h>",
         }
         self._bound_shortcuts: list[str] = []
 
@@ -82,6 +391,13 @@ class App:
         self._after_restore: str | None = None
         self._after_highlight: str | None = None
         self._programmatic = False
+
+        self._send_out_plain_text = ""
+        self._send_out_html = markdown_to_word_html("")
+        self._restore_out_plain_text = ""
+        self._restore_out_html = markdown_to_word_html("")
+        self._tree_edit_entry: ttk.Entry | None = None
+        self._tree_edit_index: int | None = None
 
         self._easter_buffer = ""
 
@@ -135,8 +451,9 @@ class App:
 
         self.slot_tree.bind("<<TreeviewSelect>>", self._on_slot_tree_select)
         self.slot_tree.bind("<Delete>", self._on_slot_tree_delete_key)
+        self.slot_tree.bind("<Double-1>", self._on_slot_tree_double_click)
 
-        # 编辑区（改名）
+        # 编辑区（关键词预览）
         edit = ttk.Frame(self.left, padding=(0, 10, 0, 0))
         edit.grid(row=2, column=0, columnspan=2, sticky="ew")
         edit.columnconfigure(1, weight=1)
@@ -144,17 +461,12 @@ class App:
         self.slot_name_var = tk.StringVar(value="")
         self.slot_keyword_var = tk.StringVar(value="")
 
-        ttk.Label(edit, text="名称：").grid(row=0, column=0, sticky="w")
-        self.slot_name_entry = ttk.Entry(edit, textvariable=self.slot_name_var)
-        self.slot_name_entry.grid(row=0, column=1, sticky="ew", padx=(6, 0))
-        ttk.Button(edit, text="改名", command=self.rename_selected_slot).grid(row=0, column=2, padx=(6, 0))
+        ttk.Label(edit, text="名称：双击左侧关键词改名").grid(row=0, column=0, columnspan=2, sticky="w")
 
         ttk.Label(edit, text="关键词：").grid(row=1, column=0, sticky="w", pady=(6, 0))
         kw_preview = ttk.Entry(edit, textvariable=self.slot_keyword_var)
         kw_preview.grid(row=1, column=1, sticky="ew", padx=(6, 0), pady=(6, 0))
         kw_preview.configure(state="readonly")
-
-        self.slot_name_entry.bind("<Return>", lambda e: self.rename_selected_slot())
 
         # 操作按钮
         btns = ttk.Frame(self.left, padding=(0, 8, 0, 0))
@@ -163,6 +475,9 @@ class App:
 
         self.bind_btn = ttk.Button(btns, text="选中文字后按快捷键命名", command=self.bind_selection_to_slot)
         self.bind_btn.grid(row=0, column=0, sticky="ew")
+
+        self.find_btn = ttk.Button(btns, text="定位名称并修改/删除（Ctrl+F）", command=self._locate_slot_for_edit_or_delete)
+        self.find_btn.grid(row=1, column=0, sticky="ew", pady=(8, 0))
 
 
         # 选项/高亮
@@ -231,7 +546,7 @@ class App:
         top_bar = ttk.Frame(t)
         top_bar.grid(row=0, column=0, sticky="ew")
         top_bar.columnconfigure(0, weight=1)
-        ttk.Label(top_bar, text="原文（粘贴你要发给AI的内容）").grid(row=0, column=0, sticky="w")
+        ttk.Label(top_bar, text="原文（支持粘贴 Markdown）").grid(row=0, column=0, sticky="w")
         ttk.Button(top_bar, text="粘贴", command=lambda: self.paste_into(self.send_in_text)).grid(
             row=0, column=1, padx=(6, 0)
         )
@@ -246,12 +561,14 @@ class App:
         self.send_in_text.grid(row=1, column=0, sticky="nsew", pady=(6, 10))
         self.send_in_scroll.grid(row=1, column=1, sticky="ns", pady=(6, 10))
         self.send_in_text.tag_configure("kw", background="#FFF59D")
+        self.send_in_text.bind("<<Copy>>", self._on_send_in_ctrl_c)
+        self.send_in_text.bind("<Control-c>", self._on_send_in_ctrl_c)
 
         bottom_bar = ttk.Frame(t)
         bottom_bar.grid(row=2, column=0, sticky="ew")
         bottom_bar.columnconfigure(0, weight=1)
-        ttk.Label(bottom_bar, text="脱敏后（发给AI）").grid(row=0, column=0, sticky="w")
-        ttk.Button(bottom_bar, text="复制", command=lambda: self.copy_from(self.send_out_text)).grid(
+        ttk.Label(bottom_bar, text="脱敏后（自动转为便于粘贴 Word 的格式）").grid(row=0, column=0, sticky="w")
+        ttk.Button(bottom_bar, text="复制", command=lambda: self.copy_result("send")).grid(
             row=0, column=1, padx=(6, 0)
         )
 
@@ -259,8 +576,10 @@ class App:
         self.send_out_text.grid(row=3, column=0, sticky="nsew", pady=(6, 0))
         self.send_out_scroll.grid(row=3, column=1, sticky="ns", pady=(6, 0))
         self.send_out_text.tag_configure("kw", background="#FFF59D")
+        self.send_out_text.bind("<<Copy>>", self._on_send_out_ctrl_c)
+        self.send_out_text.bind("<Control-c>", self._on_send_out_ctrl_c)
 
-        self.send_status = ttk.Label(t, text="替换次数：0")
+        self.send_status = ttk.Label(t, text="替换次数：0 | 已自动转换为 Word 友好格式")
         self.send_status.grid(row=4, column=0, sticky="w", pady=(8, 0))
 
         self.send_in_text.bind("<<Modified>>", self._on_send_in_modified)
@@ -274,7 +593,7 @@ class App:
         top_bar = ttk.Frame(t)
         top_bar.grid(row=0, column=0, sticky="ew")
         top_bar.columnconfigure(0, weight=1)
-        ttk.Label(top_bar, text="AI返回（粘贴AI输出）").grid(row=0, column=0, sticky="w")
+        ttk.Label(top_bar, text="AI返回（支持粘贴 Markdown）").grid(row=0, column=0, sticky="w")
         ttk.Button(top_bar, text="粘贴", command=lambda: self.paste_into(self.restore_in_text)).grid(
             row=0, column=1, padx=(6, 0)
         )
@@ -289,12 +608,14 @@ class App:
         self.restore_in_text.grid(row=1, column=0, sticky="nsew", pady=(6, 10))
         self.restore_in_scroll.grid(row=1, column=1, sticky="ns", pady=(6, 10))
         self.restore_in_text.tag_configure("kw", background="#FFF59D")
+        self.restore_in_text.bind("<<Copy>>", self._on_restore_in_ctrl_c)
+        self.restore_in_text.bind("<Control-c>", self._on_restore_in_ctrl_c)
 
         bottom_bar = ttk.Frame(t)
         bottom_bar.grid(row=2, column=0, sticky="ew")
         bottom_bar.columnconfigure(0, weight=1)
-        ttk.Label(bottom_bar, text="还原后").grid(row=0, column=0, sticky="w")
-        ttk.Button(bottom_bar, text="复制", command=lambda: self.copy_from(self.restore_out_text)).grid(
+        ttk.Label(bottom_bar, text="还原后（自动转为便于粘贴 Word 的格式）").grid(row=0, column=0, sticky="w")
+        ttk.Button(bottom_bar, text="复制", command=lambda: self.copy_result("restore")).grid(
             row=0, column=1, padx=(6, 0)
         )
 
@@ -302,8 +623,10 @@ class App:
         self.restore_out_text.grid(row=3, column=0, sticky="nsew", pady=(6, 0))
         self.restore_out_scroll.grid(row=3, column=1, sticky="ns", pady=(6, 0))
         self.restore_out_text.tag_configure("kw", background="#FFF59D")
+        self.restore_out_text.bind("<<Copy>>", self._on_restore_out_ctrl_c)
+        self.restore_out_text.bind("<Control-c>", self._on_restore_out_ctrl_c)
 
-        self.restore_status = ttk.Label(t, text="还原次数：0")
+        self.restore_status = ttk.Label(t, text="还原次数：0 | 已自动转换为 Word 友好格式")
         self.restore_status.grid(row=4, column=0, sticky="w", pady=(8, 0))
 
         self.restore_in_text.bind("<<Modified>>", self._on_restore_in_modified)
@@ -372,6 +695,86 @@ class App:
         self.slot_name_var.set(str(s.get("name", "")).strip())
         self.slot_keyword_var.set(str(s.get("keyword", "")).strip())
 
+    def _set_slot_name(self, idx: int, raw_name: str, *, show_message: bool = True) -> bool:
+        if idx is None or not (0 <= idx < len(self.slots)):
+            if show_message:
+                messagebox.showinfo(APP_NAME, "请先在左侧列表选中一个名称。")
+            return False
+
+        name = _strip_token_brackets(raw_name)
+        if not name:
+            if show_message:
+                messagebox.showinfo(APP_NAME, "名称不能为空。")
+            return False
+
+        for j, s in enumerate(self.slots):
+            if j == idx:
+                continue
+            if str(s.get("name", "")).strip() == name:
+                if show_message:
+                    messagebox.showinfo(APP_NAME, "名称已存在，请换一个名称（名称必须唯一）。")
+                return False
+
+        self.slots[idx]["name"] = name
+        self._save_slots()
+        self._refresh_slots_tree(select_index=idx)
+        self._schedule_all_updates()
+        return True
+
+    def _destroy_tree_editor(self) -> None:
+        if self._tree_edit_entry is not None:
+            try:
+                self._tree_edit_entry.destroy()
+            except Exception:
+                pass
+        self._tree_edit_entry = None
+        self._tree_edit_index = None
+
+    def _commit_tree_editor(self, *, show_message: bool = False) -> None:
+        if self._tree_edit_entry is None or self._tree_edit_index is None:
+            return
+        value = self._tree_edit_entry.get()
+        idx = self._tree_edit_index
+        if self._set_slot_name(idx, value, show_message=show_message):
+            self._destroy_tree_editor()
+            return
+        try:
+            self._tree_edit_entry.focus_set()
+            self._tree_edit_entry.selection_range(0, "end")
+        except Exception:
+            pass
+
+    def _begin_tree_rename(self, idx: int) -> None:
+        if not (0 <= idx < len(self.slots)):
+            return
+        self._destroy_tree_editor()
+        bbox = self.slot_tree.bbox(str(idx), "#1")
+        if not bbox:
+            return
+        x, y, width, height = bbox
+        entry = ttk.Entry(self.slot_tree)
+        entry.place(x=x, y=y, width=width, height=height)
+        entry.insert(0, str(self.slots[idx].get("name", "")).strip())
+        entry.select_range(0, "end")
+        entry.focus_set()
+        entry.bind("<Return>", lambda _e: self._commit_tree_editor(show_message=True))
+        entry.bind("<Escape>", lambda _e: self._destroy_tree_editor())
+        entry.bind("<FocusOut>", lambda _e: self._commit_tree_editor(show_message=False))
+        self._tree_edit_entry = entry
+        self._tree_edit_index = idx
+
+    def _on_slot_tree_double_click(self, event) -> str:
+        row_id = self.slot_tree.identify_row(event.y)
+        if not row_id:
+            return "break"
+        try:
+            idx = int(row_id)
+        except Exception:
+            return "break"
+        self._refresh_slots_tree(select_index=idx)
+        self._begin_tree_rename(idx)
+        return "break"
+
     def _on_slot_tree_select(self, _evt=None) -> None:
         idx = self._get_selected_slot_index()
         self._selected_slot_index = idx
@@ -418,28 +821,8 @@ class App:
 
     def rename_selected_slot(self) -> None:
         idx = self._get_selected_slot_index()
-        if idx is None or not (0 <= idx < len(self.slots)):
-            messagebox.showinfo(APP_NAME, "请先在左侧列表选中一个名称。")
-            return
-
         raw = self.slot_name_var.get()
-        name = _strip_token_brackets(raw)
-        if not name:
-            messagebox.showinfo(APP_NAME, "名称不能为空。")
-            return
-
-        # 名称唯一：避免 token 冲突（token = [名称]）
-        for j, s in enumerate(self.slots):
-            if j == idx:
-                continue
-            if str(s.get("name", "")).strip() == name:
-                messagebox.showinfo(APP_NAME, "名称已存在，请换一个名称（名称必须唯一）。")
-                return
-
-        self.slots[idx]["name"] = name
-        self._save_slots()
-        self._refresh_slots_tree(select_index=idx)
-        self._schedule_all_updates()
+        self._set_slot_name(idx, raw, show_message=True)
 
     def _first_empty_slot_index(self) -> int | None:
         for i, s in enumerate(self.slots):
@@ -455,6 +838,59 @@ class App:
             if str(s.get("keyword", "")).strip() == kw:
                 return i
         return None
+
+    def _find_slot_index_by_name(self, name: str) -> int | None:
+        target = (name or "").strip()
+        if not target:
+            return None
+        for i, s in enumerate(self.slots):
+            if str(s.get("name", "")).strip() == target:
+                return i
+        return None
+
+    def _focus_slot_by_index(self, idx: int, *, begin_rename: bool = False) -> None:
+        if not (0 <= idx < len(self.slots)):
+            return
+        self._refresh_slots_tree(select_index=idx)
+        self.highlight_all_var.set(False)
+        self.schedule_highlight_update()
+        try:
+            self.slot_tree.focus_set()
+        except Exception:
+            pass
+        if begin_rename:
+            self._begin_tree_rename(idx)
+
+    def _prompt_find_slot_name(self) -> str | None:
+        initial = self.slot_name_var.get().strip()
+        return simpledialog.askstring(
+            APP_NAME,
+            "请输入要定位的名称：",
+            initialvalue=initial,
+            parent=self.root,
+        )
+
+    def _locate_slot_for_edit_or_delete(self) -> bool:
+        raw_name = self._prompt_find_slot_name()
+        if raw_name is None:
+            return True
+        name = _strip_token_brackets(raw_name)
+        if not name:
+            messagebox.showinfo(APP_NAME, "请输入要定位的名称。")
+            return True
+        idx = self._find_slot_index_by_name(name)
+        if idx is None:
+            messagebox.showinfo(APP_NAME, f"未找到名称：{name}")
+            return True
+        self._focus_slot_by_index(idx, begin_rename=True)
+        return True
+
+    def _on_find_slot_shortcut(self, _evt=None):
+        w = self.root.focus_get()
+        if w in (self.send_in_text, self.restore_in_text):
+            return None
+        self._locate_slot_for_edit_or_delete()
+        return "break"
 
     def _get_selected_text(self) -> str:
         try:
@@ -481,10 +917,7 @@ class App:
             self.schedule_highlight_update()
             return
 
-        default_name = ""
-        cur_sel = self._get_selected_slot_index()
-        if cur_sel is not None and 0 <= cur_sel < len(self.slots):
-            default_name = str(self.slots[cur_sel].get("name", "")).strip()
+        default_name = kw
 
         raw_name = simpledialog.askstring(
             APP_NAME,
@@ -550,6 +983,7 @@ class App:
             pick = self._format_shortcut_for_button(self.shortcut_cfg.get("pick", ""))
             hl = self._format_shortcut_for_button(self.shortcut_cfg.get("highlight_all", ""))
             self.bind_btn.configure(text=f"选中文字后按快捷键命名（{pick or '未设置'}）")
+            self.find_btn.configure(text="定位名称并修改/删除（Ctrl+F）")
             self.highlight_btn.configure(text=f"切换标黄全部（{hl or '未设置'}）")
         except Exception:
             pass
@@ -652,7 +1086,7 @@ class App:
         hl_entry = ttk.Entry(frm, textvariable=hl_var, width=28)
         hl_entry.grid(row=1, column=1, sticky="ew", padx=(6, 0), pady=(10, 0))
 
-        tip = ttk.Label(frm, text="输入示例：Ctrl+Alt+K / Ctrl+Alt+H", foreground="#666")
+        tip = ttk.Label(frm, text="输入示例：Ctrl+C / Ctrl+Alt+H", foreground="#666")
         tip.grid(row=2, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         btns = ttk.Frame(frm)
@@ -699,6 +1133,7 @@ class App:
                 self._j_label.configure(text="J")
             except Exception:
                 pass
+
 
     def toggle_highlight_all(self, _evt=None) -> None:
         self.highlight_all_var.set(not bool(self.highlight_all_var.get()))
@@ -770,6 +1205,43 @@ class App:
 
     # ---------------- 事件/调度 ----------------
 
+    def _copy_text_selection_or_all(self, widget: tk.Text) -> None:
+        self.root.clipboard_clear()
+        try:
+            data = widget.get("sel.first", "sel.last")
+        except tk.TclError:
+            data = widget.get("1.0", "end-1c")
+        self.root.clipboard_append(data)
+        self.root.update()
+
+    def _on_send_in_ctrl_c(self, _evt=None):
+        self.bind_selection_to_slot(_evt)
+        return "break"
+
+    def _on_restore_in_ctrl_c(self, _evt=None):
+        self._copy_text_selection_or_all(self.restore_in_text)
+        return "break"
+
+    def _on_send_out_ctrl_c(self, _evt=None):
+        self.copy_result("send")
+        return "break"
+
+    def _on_restore_out_ctrl_c(self, _evt=None):
+        self.copy_result("restore")
+        return "break"
+
+    def _on_any_ctrl_c_copy(self, _evt=None):
+        w = self.root.focus_get()
+        if w is self.send_out_text:
+            return self._on_send_out_ctrl_c(_evt)
+        if w is self.restore_out_text:
+            return self._on_restore_out_ctrl_c(_evt)
+        if w is self.send_in_text:
+            return self._on_send_in_ctrl_c(_evt)
+        if w is self.restore_in_text:
+            return self._on_restore_in_ctrl_c(_evt)
+        return None
+
     def _on_send_in_modified(self, _event) -> None:
         if self._programmatic:
             self.send_in_text.edit_modified(False)
@@ -826,6 +1298,26 @@ class App:
         kws = normalize_keywords(kws)
         return kws, override
 
+    def _get_text_preview(self, text: str) -> str:
+        preview = html_to_preview_text(text)
+        return preview if preview else text
+
+    def _to_word_html(self, text: str) -> str:
+        fragment = markdown_to_word_html(text)
+        if fragment:
+            return fragment
+        return f"<p>{html.escape(text or '')}</p>" if text else ""
+
+    def _set_output_content(self, widget: tk.Text, plain_text: str, html_content: str) -> None:
+        preview = self._get_text_preview(plain_text)
+        self.set_readonly_text(widget, preview)
+        if widget is self.send_out_text:
+            self._send_out_plain_text = plain_text
+            self._send_out_html = html_content
+        elif widget is self.restore_out_text:
+            self._restore_out_plain_text = plain_text
+            self._restore_out_html = html_content
+
     def update_desensitize(self) -> None:
         self._after_desensitize = None
 
@@ -844,8 +1336,9 @@ class App:
         self.latest_mapping = make_mapping_payload(res.token_to_keyword, res.keyword_to_token)
         save_json(self.mapping_path, self.latest_mapping)
 
-        self.set_readonly_text(self.send_out_text, res.output_text)
-        self.send_status.configure(text=f"替换次数：{res.replacement_count} | 映射已保存到：{self.mapping_path}")
+        html_output = self._to_word_html(res.output_text)
+        self._set_output_content(self.send_out_text, res.output_text, html_output)
+        self.send_status.configure(text=f"替换次数：{res.replacement_count} | 映射已保存到：{self.mapping_path} | 已转 Word 格式")
 
         self.update_highlights()
 
@@ -869,10 +1362,11 @@ class App:
         tok_to_kw = self._get_token_mapping_for_restore()
 
         out, count = restore(text, tok_to_kw)
-        self.set_readonly_text(self.restore_out_text, out)
+        html_output = self._to_word_html(out)
+        self._set_output_content(self.restore_out_text, out, html_output)
 
         mapping_state = "已加载上次映射" if tok_to_kw else "未找到映射（请先在脱敏页替换一次）"
-        self.restore_status.configure(text=f"还原次数：{count} | {mapping_state}")
+        self.restore_status.configure(text=f"还原次数：{count} | {mapping_state} | 已转 Word 格式")
 
         # 还原页也跟随“标黄全部/只标黄选中”刷新高亮
         self.schedule_highlight_update()
@@ -962,6 +1456,95 @@ class App:
         self.root.clipboard_append(text)
         self.root.update()
 
+    def _copy_html_to_clipboard(self, plain_text: str, html_content: str) -> None:
+        text = plain_text or ""
+        if html_content:
+            fragment = html_content
+        else:
+            fragment = self._to_word_html(text)
+        html_bytes = build_cf_html(fragment)
+        if os.name != "nt":
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.root.update()
+            return
+
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+
+        html_format = user32.RegisterClipboardFormatW(CF_HTML_NAME)
+
+        user32.OpenClipboard.argtypes = [wintypes.HWND]
+        user32.OpenClipboard.restype = wintypes.BOOL
+        user32.EmptyClipboard.argtypes = []
+        user32.EmptyClipboard.restype = wintypes.BOOL
+        user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+        user32.SetClipboardData.restype = wintypes.HANDLE
+        user32.CloseClipboard.argtypes = []
+        user32.CloseClipboard.restype = wintypes.BOOL
+
+        kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+        kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+        kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalLock.restype = wintypes.LPVOID
+        kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalUnlock.restype = wintypes.BOOL
+        kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+        kernel32.GlobalFree.restype = wintypes.HGLOBAL
+
+        if not user32.OpenClipboard(None):
+            raise OSError("无法打开剪贴板。")
+        try:
+            if not user32.EmptyClipboard():
+                raise OSError("清空剪贴板失败。")
+
+            def put_clipboard_data(fmt: int, payload: bytes) -> None:
+                size = len(payload)
+                handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, size)
+                if not handle:
+                    raise MemoryError("分配剪贴板内存失败。")
+                locked = kernel32.GlobalLock(handle)
+                if not locked:
+                    kernel32.GlobalFree(handle)
+                    raise MemoryError("锁定剪贴板内存失败。")
+                ctypes.memmove(locked, payload, size)
+                kernel32.GlobalUnlock(handle)
+                if not user32.SetClipboardData(fmt, handle):
+                    kernel32.GlobalFree(handle)
+                    raise OSError("写入剪贴板失败。")
+
+            put_clipboard_data(CF_UNICODETEXT, (text + "\0").encode("utf-16-le"))
+            put_clipboard_data(html_format, html_bytes + b"\0")
+        finally:
+            user32.CloseClipboard()
+        self.root.update()
+
+    def copy_result(self, kind: str) -> None:
+        try:
+            if kind == "send":
+                self._copy_html_to_clipboard(self._get_text_preview(self._send_out_plain_text), self._send_out_html)
+                return
+            if kind == "restore":
+                self._copy_html_to_clipboard(self._get_text_preview(self._restore_out_plain_text), self._restore_out_html)
+                return
+            raise ValueError(f"未知复制类型：{kind}")
+        except Exception as e:
+            # 兜底：至少能复制纯文本
+            try:
+                if kind == "send":
+                    self.root.clipboard_clear()
+                    self.root.clipboard_append(self._get_text_preview(self._send_out_plain_text))
+                    self.root.update()
+                    return
+                if kind == "restore":
+                    self.root.clipboard_clear()
+                    self.root.clipboard_append(self._get_text_preview(self._restore_out_plain_text))
+                    self.root.update()
+                    return
+            except Exception:
+                pass
+            messagebox.showinfo(APP_NAME, f"复制失败：{e}")
+
     def paste_into(self, widget: tk.Text) -> None:
         try:
             data = self.root.clipboard_get()
@@ -1006,11 +1589,11 @@ class App:
 
     def desensitize_and_copy(self) -> None:
         self.update_desensitize()
-        self.copy_from(self.send_out_text)
+        self.copy_result("send")
 
     def restore_and_copy(self) -> None:
         self.update_restore()
-        self.copy_from(self.restore_out_text)
+        self.copy_result("restore")
 
     def on_close(self) -> None:
         try:
