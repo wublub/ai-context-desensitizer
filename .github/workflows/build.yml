@@ -31,15 +31,20 @@ jobs:
           pip install pyinstaller
 
       - name: Build
+        shell: bash
         run: |
-          pyinstaller --noconfirm --onefile main.py
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            pyinstaller --noconfirm ai-context-desensitizer.spec
+          else
+            pyinstaller --noconfirm --onefile main.py
+          fi
 
       - name: Package
         shell: bash
         run: |
           mkdir -p release
           if [[ "${{ runner.os }}" == "Windows" ]]; then
-            cp dist/main.exe release/ai-context-desensitizer-windows.exe
+            cp dist/ai-context-desensitizer.exe release/ai-context-desensitizer-windows.exe
           elif [[ "${{ runner.os }}" == "macOS" ]]; then
             cp dist/main release/ai-context-desensitizer-macos
           else

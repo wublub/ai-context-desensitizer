@@ -198,11 +198,47 @@ def markdown_to_word_html(text: str) -> str:
             i += 1
             continue
 
+        # 水平分隔线：---、***、___ （至少 3 个连续字符）
+        if re.match(r"^[-*_]{3,}$", stripped):
+            close_list()
+            parts.append('<hr style="border:none;border-top:1px solid #999;margin:12px 0;">')
+            i += 1
+            continue
+
         heading = re.match(r"^(#{1,6})\s+(.*)$", stripped)
         if heading:
             close_list()
             level = len(heading.group(1))
             parts.append(f"<h{level}>{render_inline(heading.group(2).strip())}</h{level}>")
+            i += 1
+            continue
+
+        # 引用块 blockquote（支持多行连续 >）
+        if stripped.startswith(">"):
+            close_list()
+            bq_lines: list[str] = []
+            while i < len(lines):
+                cur = (lines[i] or "").strip()
+                if cur.startswith(">"):
+                    content = cur[1:].lstrip()
+                    bq_lines.append(render_inline(content) if content else "<br>")
+                    i += 1
+                else:
+                    break
+            parts.append(
+                '<blockquote style="border-left:3px solid #ccc;margin:8px 0;padding:4px 12px;color:#555;">'
+                + "<br>".join(bq_lines)
+                + "</blockquote>"
+            )
+            continue
+
+        # checkbox 列表：- [ ] 或 - [x]
+        checkbox = re.match(r"^[-*+]\s+\[([ xX])\]\s+(.*)$", stripped)
+        if checkbox:
+            open_list("ul")
+            checked = checkbox.group(1).lower() == "x"
+            symbol = "&#9745;" if checked else "&#9744;"
+            parts.append(f"<li style=\"list-style:none;\">{symbol} {render_inline(checkbox.group(2).strip())}</li>")
             i += 1
             continue
 
@@ -289,10 +325,42 @@ def html_to_preview_text(text: str) -> str:
             i += 1
             continue
 
+        # 水平分隔线
+        if re.match(r"^[-*_]{3,}$", stripped):
+            out.append("————————————————")
+            out.append("")
+            i += 1
+            continue
+
         heading = re.match(r"^(#{1,6})\s+(.*)$", stripped)
         if heading:
             out.append(heading.group(2).strip())
             out.append("")
+            i += 1
+            continue
+
+        # 引用块
+        if stripped.startswith(">"):
+            while i < len(lines):
+                cur = (lines[i] or "").strip()
+                if cur.startswith(">"):
+                    content = cur[1:].lstrip()
+                    plain_bq = re.sub(r"\*\*(.+?)\*\*", r"\1", content)
+                    plain_bq = re.sub(r"__(.+?)__", r"\1", plain_bq)
+                    plain_bq = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"\1", plain_bq)
+                    plain_bq = re.sub(r"`([^`]+)`", r"\1", plain_bq)
+                    out.append(f"  {plain_bq}" if plain_bq else "")
+                    i += 1
+                else:
+                    break
+            continue
+
+        # checkbox 列表
+        checkbox = re.match(r"^[-*+]\s+\[([ xX])\]\s+(.*)$", stripped)
+        if checkbox:
+            checked = checkbox.group(1).lower() == "x"
+            symbol = "☑" if checked else "☐"
+            out.append(f"{symbol} {checkbox.group(2).strip()}")
             i += 1
             continue
 
@@ -1117,7 +1185,7 @@ class App:
     def show_about(self) -> None:
         messagebox.showinfo(
             "关于",
-            "AI脱敏工具\n\n致谢：大模型 gpt5.2\n致谢：产品经理 wublub",
+            "AI脱敏工具\n\n致谢：大模型 gpt5.2、gpt5.4\n致谢：产品经理 wublub",
         )
 
     def _on_any_key_for_easter(self, event):
@@ -1449,12 +1517,6 @@ class App:
                 self.highlight_keywords(self.restore_out_text, [keyword], ignore_case=False)
 
     # ---------------- 按钮：剪贴板 ----------------
-
-    def copy_from(self, widget: tk.Text) -> None:
-        text = widget.get("1.0", "end-1c")
-        self.root.clipboard_clear()
-        self.root.clipboard_append(text)
-        self.root.update()
 
     def _copy_html_to_clipboard(self, plain_text: str, html_content: str) -> None:
         text = plain_text or ""
